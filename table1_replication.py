@@ -25,71 +25,44 @@ def make_dummies(series):
     return pd.get_dummies(series, drop_first=True, dtype=float)
 
 def run_2sls(data, dep_var, filter_attacks=False):
-    """
-    Run 2SLS regression
-    Args:
-        data: DataFrame with all variables
-        dep_var: dependent variable ('daily_woi' or 'daily_woi_nc')
-        filter_attacks: if True, keep only days with attacks (Panel B)
-    Returns: dict with regression results
-    """
-    # Filter for Panel B (days with Israeli or Palestinian attacks)
+    """Run proper 2SLS with linearmodels"""
     if filter_attacks:
-        data = data[(data['occurrence_t_y']==1) | (data['occurrence_pal_t_y']==1)]
-    
-    # Select columns and drop missing values
+        data = data[(data['occurrence_t_y'] == 1) | (data['occurrence_pal_t_y'] == 1)]
+
+    # Clean data
     cols = ['high_intensity', 'length_conflict_news', dep_var, 'month', 'year', 'dow', 'monthyear']
     d = data[cols].dropna().copy()
-    
-    # Convert to numeric
     for col in ['high_intensity', 'length_conflict_news', dep_var]:
         d[col] = pd.to_numeric(d[col], errors='coerce')
-    d = d.dropna()
-    
-    # Fixed effects (year, month, day-of-week dummies)
+    d = d.dropna().reset_index(drop=True)
+
+    # Fixed effects
     fe = pd.concat([make_dummies(d['year']), make_dummies(d['month']), make_dummies(d['dow'])], axis=1)
-    
-    # --- FIRST STAGE: regress endogenous var on instrument ---
-    y1 = d['length_conflict_news'].values
-    X1 = sm.add_constant(pd.concat([d[['high_intensity']].reset_index(drop=True), fe.reset_index(drop=True)], axis=1)).astype(float)
-    
-    m1 = OLS(y1, X1).fit(cov_type='cluster', cov_kwds={'groups': d['monthyear'].values})
-    
-    # --- SECOND STAGE: regress outcome on fitted values ---
-    y2 = d[dep_var].values
-    X2 = sm.add_constant(pd.concat([pd.Series(m1.fittedvalues, name='length_hat'), fe.reset_index(drop=True)], axis=1)).astype(float)
-    
-    m2 = OLS(y2, X2).fit()
 
-    # --- CORRECT R² CALCULATION (using original X, not fitted) ---
-    # Get 2SLS coefficient
-    beta_2sls = m2.params['length_hat']
-    beta_const = m2.params['const']
-    beta_fe = m2.params[2:].values  # FE coefficients
-
-    # Predicted Y using ORIGINAL X (not X_hat)
-    x_original = d['length_conflict_news'].values
-    y_pred = beta_const + beta_2sls * x_original + np.dot(fe.values, beta_fe)
-
-    # Residuals and R²
-    residuals = y2 - y_pred
-    SSR = np.sum(residuals ** 2)
-    SST = np.sum((y2 - np.mean(y2)) ** 2)
-    r2_correct = 1 - SSR / SST
-
-    # F-statistic for instrument strength
+    # First stage (for F-stat)
+    X1 = sm.add_constant(pd.concat([d[['high_intensity']], fe], axis=1)).astype(float)
+    from statsmodels.regression.linear_model import OLS
+    m1 = OLS(d['length_conflict_news'].values, X1).fit(cov_type='cluster', cov_kwds={'groups': d['monthyear'].values})
     f_stat = (m1.params['high_intensity'] / m1.bse['high_intensity']) ** 2
-    
+
+    # 2SLS with linearmodels (correct R² and SE automatically)
+    model = IV2SLS(
+        dependent=d[dep_var],
+        exog=sm.add_constant(fe),
+        endog=d[['length_conflict_news']],
+        instruments=d[['high_intensity']]
+    ).fit(cov_type='clustered', clusters=d['monthyear'])
+
     return {
-        'n': int(m1.nobs),
+        'n': int(model.nobs),
         'coef_1st': m1.params['high_intensity'],
         'se_1st': m1.bse['high_intensity'],
         'r2_1st': m1.rsquared,
         'f_stat': f_stat,
-        'coef_2nd': m2.params['length_hat'],
-        'se_2nd': m2.bse['length_hat'],
-        'pval_2nd': m2.pvalues['length_hat'],
-        'r2_2nd': r2_correct
+        'coef_2nd': model.params['length_conflict_news'],
+        'se_2nd': model.std_errors['length_conflict_news'],
+        'pval_2nd': model.pvalues['length_conflict_news'],
+        'r2_2nd': model.rsquared
     }
 
 def stars(pval):
