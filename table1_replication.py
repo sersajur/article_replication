@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 from statsmodels.regression.linear_model import OLS
+from linearmodels.iv import IV2SLS
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -59,7 +60,23 @@ def run_2sls(data, dep_var, filter_attacks=False):
     X2 = sm.add_constant(pd.concat([pd.Series(m1.fittedvalues, name='length_hat'), fe.reset_index(drop=True)], axis=1)).astype(float)
     
     m2 = OLS(y2, X2).fit()
-    
+
+    # --- CORRECT R² CALCULATION (using original X, not fitted) ---
+    # Get 2SLS coefficient
+    beta_2sls = m2.params['length_hat']
+    beta_const = m2.params['const']
+    beta_fe = m2.params[2:].values  # FE coefficients
+
+    # Predicted Y using ORIGINAL X (not X_hat)
+    x_original = d['length_conflict_news'].values
+    y_pred = beta_const + beta_2sls * x_original + np.dot(fe.values, beta_fe)
+
+    # Residuals and R²
+    residuals = y2 - y_pred
+    SSR = np.sum(residuals ** 2)
+    SST = np.sum((y2 - np.mean(y2)) ** 2)
+    r2_correct = 1 - SSR / SST
+
     # F-statistic for instrument strength
     f_stat = (m1.params['high_intensity'] / m1.bse['high_intensity']) ** 2
     
@@ -72,7 +89,7 @@ def run_2sls(data, dep_var, filter_attacks=False):
         'coef_2nd': m2.params['length_hat'],
         'se_2nd': m2.bse['length_hat'],
         'pval_2nd': m2.pvalues['length_hat'],
-        'r2_2nd': m2.rsquared
+        'r2_2nd': r2_correct
     }
 
 def stars(pval):
