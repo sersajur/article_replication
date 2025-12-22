@@ -1,474 +1,767 @@
 """
-Replication of Table 5: Attacks and Next-day News Pressure
+Replication of Table 5: Attacks and Next-Day News Pressure
 Driven by Predictable Political and Sports Events
 
-Structure:
-    Panel A: Israeli attacks & predictable events
-    Panel B: Palestinian attacks & predictable events  
-    Panel C: Placebo - Israeli attacks & disasters
+Source: Durante & Zhuravskaya (JPE)
 """
+
+# =============================================================================
+# IMPORTS
+# =============================================================================
 
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-from statsmodels.sandbox.regression.gmm import IV2SLS
-from linearmodels.iv import IV2SLS as LinearIV2SLS
+from linearmodels.iv import IV2SLS
 from scipy import stats
 import warnings
+
 warnings.filterwarnings('ignore')
 
-# ============================================================================
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+class Config:
+    """Central configuration for paths and variables."""
+
+    DATA_PATH = "replication_file1.dta"
+    OUTPUT_PATH = "table5_results.xlsx"
+
+    # Fixed effects
+    FE_FULL = ['month', 'year', 'dow']      # Panel A, C
+    FE_PARTIAL = ['year', 'dow']            # Panel B
+
+    # Prior attacks (controls)
+    PRIOR_PAL = ['occurrence_pal_1', 'occurrence_pal_2_7', 'occurrence_pal_8_14']
+    PRIOR_ISR = ['occurrence_1', 'occurrence_2_7', 'occurrence_8_14']
+
+
+# =============================================================================
 # DATA LOADING
-# ============================================================================
+# =============================================================================
 
-def load_data(filepath):
-    """Load replication data (.dta or .csv)"""
-    if filepath.endswith('.dta'):
-        return pd.read_stata(filepath)
-    elif filepath.endswith('.csv'):
-        return pd.read_csv(filepath)
-    else:
-        raise ValueError("File must be .dta or .csv")
+def load_data(path: str) -> pd.DataFrame:
+    """Load and prepare data."""
+    df = pd.read_stata(path)
+    df = df.sort_values('date').reset_index(drop=True)
 
-# ============================================================================
-# VARIABLE CREATION
-# ============================================================================
+    # Convert key numeric variables
+    numeric_cols = [
+        'leaddaily_woi', 'leaddaily_woi_nc', 'daily_woi', 'daily_woi_nc',
+        'lead_maj_events', 'lead_disaster',
+        'occurrence', 'occurrence_pal',
+        'occurrence_pal_1', 'occurrence_pal_2_7', 'occurrence_pal_8_14',
+        'occurrence_1', 'occurrence_2_7', 'occurrence_8_14',
+        'victims_isr', 'victims_pal',
+        'gaza_war', 'month', 'year', 'dow'
+    ]
 
-def create_variables(df):
-    """Create necessary variables for analysis"""
-    
-    # Month dummies (mon2-mon12)
-    month_dummies = pd.get_dummies(df['month'], prefix='mon', drop_first=True)
-    
-    # Year dummies (year2-year12)
-    year_dummies = pd.get_dummies(df['year'], prefix='year', drop_first=True)
-    
-    # Day of week dummies (day2-day7)
-    dow_dummies = pd.get_dummies(df['dow'], prefix='day', drop_first=True)
-    
-    # Combine
-    df = pd.concat([df, month_dummies, year_dummies, dow_dummies], axis=1)
-    
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Ensure monthyear is suitable for clustering
+    if 'monthyear' in df.columns:
+        if df['monthyear'].dtype == 'object' or df['monthyear'].dtype.name == 'category':
+            df['monthyear'] = pd.Categorical(df['monthyear']).codes
+
     return df
 
-# ============================================================================
-# FIRST STAGE REGRESSIONS
-# ============================================================================
 
-def first_stage(df, dep_var, instrument, controls, cluster_var):
-    """
-    OLS first stage
-    dep_var: 'leaddaily_woi' or 'leaddaily_woi_nc'
-    instrument: 'lead_maj_events' or 'lead_disaster'
-    """
-    
-    # Build formula
-    X_vars = [instrument] + controls
-    X = sm.add_constant(df[X_vars])
-    y = df[dep_var]
-    
-    # Fit model
-    model = sm.OLS(y, X, missing='drop')
-    
-    # Cluster-robust SE
-    results = model.fit(cov_type='cluster', 
-                       cov_kwds={'groups': df[cluster_var]})
-    
-    # F-statistic for instrument
-    f_stat = results.f_test(instrument + '=0').fvalue[0][0]
-    
-    return results, f_stat
+def filter_sample(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply gaza_war==0 filter."""
+    return df[df['gaza_war'] == 0].copy()
 
-# ============================================================================
-# SECOND STAGE IV (2SLS)
-# ============================================================================
 
-def second_stage_occurrence(df, dep_var, endog_var, instrument, 
-                           controls, cluster_var):
-    """
-    2SLS for binary outcome (occurrence)
-    """
-    
-    # Prepare data
-    y = df[dep_var].values
-    X_exog = sm.add_constant(df[controls]).values
-    X_endog = df[[endog_var]].values
-    X_instruments = df[[instrument]].values
-    
-    # Drop missing
-    mask = ~(np.isnan(y) | np.isnan(X_endog).any(axis=1) | 
-             np.isnan(X_exog).any(axis=1))
-    
-    y = y[mask]
-    X_exog = X_exog[mask]
-    X_endog = X_endog[mask]
-    X_instruments = X_instruments[mask]
-    clusters = df[cluster_var].values[mask]
-    
-    # Fit 2SLS
-    model = IV2SLS(y, X_exog, X_endog, X_instruments)
-    results = model.fit(cov_type='cluster', 
-                       cov_kwds={'groups': clusters})
-    
-    return results
+# =============================================================================
+# FIXED EFFECTS GENERATION
+# =============================================================================
 
-# ============================================================================
-# NEGATIVE BINOMIAL (for victims count)
-# ============================================================================
+def create_dummies(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    """Create dummy variables for fixed effects."""
+    result = df.copy()
+    for col in cols:
+        # Convert to numeric codes if categorical
+        if result[col].dtype == 'object' or result[col].dtype.name == 'category':
+            result[col] = pd.Categorical(result[col]).codes
 
-def negbin_iv(df, dep_var, endog_var, instrument, controls, cluster_var):
-    """
-    Negative binomial with IV
-    Uses control function approach
-    """
-    
-    # Step 1: First stage residuals
-    first_stage_model = sm.OLS(df[endog_var], 
-                               sm.add_constant(df[[instrument] + controls]))
-    fs_results = first_stage_model.fit()
-    residuals = fs_results.resid
-    
-    # Step 2: Include residuals in NB model
-    X_vars = [endog_var] + controls + ['_residuals']
-    df_temp = df.copy()
-    df_temp['_residuals'] = residuals
-    
-    X = sm.add_constant(df_temp[X_vars])
-    y = df_temp[dep_var]
-    
-    model = sm.GLM(y, X, family=sm.families.NegativeBinomial(), 
-                   missing='drop')
-    results = model.fit(cov_type='cluster', 
-                       cov_kwds={'groups': df_temp[cluster_var]})
-    
-    return results
+        # Create dummies with numeric dtype
+        dummies = pd.get_dummies(result[col], prefix=col, drop_first=True, dtype=float)
+        result = pd.concat([result, dummies], axis=1)
+    return result
 
-# ============================================================================
-# REDUCED FORM (OLS / GLM)
-# ============================================================================
 
-def reduced_form_occurrence(df, dep_var, instrument, controls, cluster_var):
-    """OLS reduced form for occurrence"""
-    
-    X_vars = [instrument] + controls
-    X = sm.add_constant(df[X_vars])
-    y = df[dep_var]
-    
-    model = sm.OLS(y, X, missing='drop')
-    results = model.fit(cov_type='cluster', 
-                       cov_kwds={'groups': df[cluster_var]})
-    
-    return results
+def get_fe_columns(df: pd.DataFrame, fe_vars: list) -> list:
+    """Get list of fixed effect dummy column names."""
+    fe_cols = []
+    for var in fe_vars:
+        fe_cols += [c for c in df.columns if c.startswith(f'{var}_')]
+    return fe_cols
 
-def reduced_form_victims(df, dep_var, instrument, controls, cluster_var):
-    """GLM negative binomial reduced form for victims"""
-    
-    X_vars = [instrument] + controls
-    X = sm.add_constant(df[X_vars])
-    y = df[dep_var]
-    
-    model = sm.GLM(y, X, family=sm.families.NegativeBinomial(), 
-                   missing='drop')
-    results = model.fit(cov_type='cluster', 
-                       cov_kwds={'groups': df[cluster_var]})
-    
-    return results
 
-# ============================================================================
-# PANEL A: ISRAELI ATTACKS & PREDICTABLE EVENTS
-# ============================================================================
+def ensure_numeric(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    """Ensure all columns are numeric."""
+    result = df.copy()
+    for col in cols:
+        if col in result.columns:
+            result[col] = pd.to_numeric(result[col], errors='coerce')
+    return result
 
-def panel_a(df):
-    """
-    Panel A: Israeli Attacks and Predictable Newsworthy Events
-    """
-    
-    print("\n" + "="*70)
-    print("PANEL A: ISRAELI ATTACKS & PREDICTABLE EVENTS")
-    print("="*70)
-    
-    # Filter: no Gaza war
-    df_a = df[df['gaza_war'] == 0].copy()
-    
-    # Controls
-    controls_isr = ['occurrence_pal_1', 'occurrence_pal_2_7', 
-                    'occurrence_pal_8_14']
-    
-    # Add FE dummies
-    month_cols = [c for c in df_a.columns if c.startswith('mon')]
-    year_cols = [c for c in df_a.columns if c.startswith('year')]
-    dow_cols = [c for c in df_a.columns if c.startswith('day')]
-    
-    controls_full = controls_isr + month_cols + year_cols + dow_cols
-    
-    cluster = 'monthyear'
-    
-    # Column 1: First stage - corrected news pressure
-    print("\n[Col 1] First stage: P(t+1) ~ Political/Sports events")
-    fs1, f1 = first_stage(df_a, 'leaddaily_woi', 'lead_maj_events', 
-                         controls_full, cluster)
-    print(f"  Coef: {fs1.params['lead_maj_events']:.3f}")
-    print(f"  SE:   {fs1.bse['lead_maj_events']:.3f}")
-    print(f"  F-stat: {f1:.2f}")
-    
-    # Column 2: First stage - uncorrected news pressure
-    print("\n[Col 2] First stage: Uncorrected P(t+1) ~ events")
-    fs2, f2 = first_stage(df_a, 'leaddaily_woi_nc', 'lead_maj_events',
-                         controls_full, cluster)
-    print(f"  Coef: {fs2.params['lead_maj_events']:.3f}")
-    print(f"  SE:   {fs2.bse['lead_maj_events']:.3f}")
-    print(f"  F-stat: {f2:.2f}")
-    
-    # Column 3: 2SLS - occurrence (corrected)
-    print("\n[Col 3] 2SLS: Occurrence ~ P(t+1)")
-    ss3 = second_stage_occurrence(df_a, 'occurrence', 'leaddaily_woi',
-                                  'lead_maj_events', controls_full, cluster)
-    print(f"  Coef: {ss3.params['leaddaily_woi']:.3f}")
-    print(f"  SE:   {ss3.bse['leaddaily_woi']:.3f}")
-    
-    # Column 4: 2SLS - occurrence (uncorrected)
-    print("\n[Col 4] 2SLS: Occurrence ~ Uncorrected P(t+1)")
-    ss4 = second_stage_occurrence(df_a, 'occurrence', 'leaddaily_woi_nc',
-                                  'lead_maj_events', controls_full, cluster)
-    print(f"  Coef: {ss4.params['leaddaily_woi_nc']:.3f}")
-    print(f"  SE:   {ss4.bse['leaddaily_woi_nc']:.3f}")
-    
-    # Column 5: Reduced form - occurrence
-    print("\n[Col 5] Reduced form: Occurrence ~ events")
-    rf5 = reduced_form_occurrence(df_a, 'occurrence', 'lead_maj_events',
-                                  controls_full, cluster)
-    print(f"  Coef: {rf5.params['lead_maj_events']:.3f}")
-    print(f"  SE:   {rf5.bse['lead_maj_events']:.3f}")
-    
-    # Column 6: 2SLS - victims (corrected) [Negative Binomial]
-    print("\n[Col 6] NB-IV: Victims ~ P(t+1)")
-    nb6 = negbin_iv(df_a, 'victims_isr', 'leaddaily_woi', 'lead_maj_events',
-                    controls_full, cluster)
-    print(f"  Coef: {nb6.params['leaddaily_woi']:.3f}")
-    print(f"  SE:   {nb6.bse['leaddaily_woi']:.3f}")
-    
-    # Column 7: 2SLS - victims (uncorrected)
-    print("\n[Col 7] NB-IV: Victims ~ Uncorrected P(t+1)")
-    nb7 = negbin_iv(df_a, 'victims_isr', 'leaddaily_woi_nc', 
-                    'lead_maj_events', controls_full, cluster)
-    print(f"  Coef: {nb7.params['leaddaily_woi_nc']:.3f}")
-    print(f"  SE:   {nb7.bse['leaddaily_woi_nc']:.3f}")
-    
-    # Column 8: Reduced form - victims
-    print("\n[Col 8] Reduced form: Victims ~ events")
-    rf8 = reduced_form_victims(df_a, 'victims_isr', 'lead_maj_events',
-                               controls_full, cluster)
-    print(f"  Coef: {rf8.params['lead_maj_events']:.3f}")
-    print(f"  SE:   {rf8.bse['lead_maj_events']:.3f}")
 
-# ============================================================================
-# PANEL B: PALESTINIAN ATTACKS & PREDICTABLE EVENTS
-# ============================================================================
+# =============================================================================
+# REGRESSION MODELS
+# =============================================================================
 
-def panel_b(df):
-    """
-    Panel B: Palestinian Attacks and Predictable Newsworthy Events
-    """
-    
-    print("\n" + "="*70)
-    print("PANEL B: PALESTINIAN ATTACKS & PREDICTABLE EVENTS")
-    print("="*70)
-    
-    # Filter: no Gaza war
-    df_b = df[df['gaza_war'] == 0].copy()
-    
-    # Controls (different from Panel A)
-    controls_pal = ['occurrence_1', 'occurrence_2_7', 'occurrence_8_14']
-    
-    # No month FE for Palestinian attacks
-    year_cols = [c for c in df_b.columns if c.startswith('year')]
-    dow_cols = [c for c in df_b.columns if c.startswith('day')]
-    
-    controls_full = controls_pal + year_cols + dow_cols
-    
-    cluster = 'monthyear'
-    
-    # Column 1: First stage
-    print("\n[Col 1] First stage: P(t+1) ~ events")
-    fs1, f1 = first_stage(df_b, 'leaddaily_woi', 'lead_maj_events',
-                         controls_full, cluster)
-    print(f"  Coef: {fs1.params['lead_maj_events']:.3f}")
-    print(f"  SE:   {fs1.bse['lead_maj_events']:.3f}")
-    print(f"  F-stat: {f1:.2f}")
-    
-    # Column 2: First stage - uncorrected
-    print("\n[Col 2] First stage: Uncorrected P(t+1) ~ events")
-    fs2, f2 = first_stage(df_b, 'leaddaily_woi_nc', 'lead_maj_events',
-                         controls_full, cluster)
-    print(f"  Coef: {fs2.params['lead_maj_events']:.3f}")
-    print(f"  SE:   {fs2.bse['lead_maj_events']:.3f}")
-    print(f"  F-stat: {f2:.2f}")
-    
-    # Column 3: 2SLS - occurrence
-    print("\n[Col 3] 2SLS: Occurrence ~ P(t+1)")
-    ss3 = second_stage_occurrence(df_b, 'occurrence_pal', 'leaddaily_woi',
-                                  'lead_maj_events', controls_full, cluster)
-    print(f"  Coef: {ss3.params['leaddaily_woi']:.3f}")
-    print(f"  SE:   {ss3.bse['leaddaily_woi']:.3f}")
-    
-    # Column 4: 2SLS - occurrence (uncorrected)
-    print("\n[Col 4] 2SLS: Occurrence ~ Uncorrected P(t+1)")
-    ss4 = second_stage_occurrence(df_b, 'occurrence_pal', 'leaddaily_woi_nc',
-                                  'lead_maj_events', controls_full, cluster)
-    print(f"  Coef: {ss4.params['leaddaily_woi_nc']:.3f}")
-    print(f"  SE:   {ss4.bse['leaddaily_woi_nc']:.3f}")
-    
+def ols_clustered(df: pd.DataFrame, y_var: str, x_vars: list,
+                  cluster_var: str) -> dict:
+    """OLS with clustered standard errors."""
+    all_vars = [y_var] + x_vars + [cluster_var]
+    data = df[all_vars].copy()
+
+    # Ensure numeric types
+    for col in [y_var] + x_vars:
+        data[col] = pd.to_numeric(data[col], errors='coerce')
+
+    # Drop missing values
+    data = data.dropna()
+
+    y = data[y_var].astype(float)
+    X = sm.add_constant(data[x_vars].astype(float))
+
+    model = sm.OLS(y, X).fit(
+        cov_type='cluster',
+        cov_kwds={'groups': data[cluster_var]}
+    )
+
+    return {
+        'coef': model.params,
+        'se': model.bse,
+        'pval': model.pvalues,
+        'r2': model.rsquared,
+        'nobs': int(model.nobs),
+        'model': model
+    }
+
+
+def iv_2sls(df: pd.DataFrame, y_var: str, endog_var: str,
+            instrument: str, controls: list, cluster_var: str) -> dict:
+    """2SLS IV regression with clustered standard errors."""
+    all_vars = [y_var, endog_var, instrument] + controls + [cluster_var]
+    data = df[all_vars].copy()
+
+    # Ensure numeric types
+    for col in [y_var, endog_var, instrument] + controls:
+        data[col] = pd.to_numeric(data[col], errors='coerce')
+
+    data = data.dropna()
+
+    y = data[y_var].astype(float)
+    endog = data[[endog_var]].astype(float)
+    instr = data[[instrument]].astype(float)
+    exog = sm.add_constant(data[controls].astype(float))
+
+    model = IV2SLS(y, exog, endog, instr).fit(
+        cov_type='clustered',
+        clusters=data[cluster_var]
+    )
+
+    return {
+        'coef': model.params,
+        'se': model.std_errors,
+        'pval': model.pvalues,
+        'r2': model.rsquared,
+        'nobs': int(model.nobs),
+        'model': model
+    }
+
+
+def first_stage_f(df: pd.DataFrame, endog_var: str, instrument: str,
+                  controls: list, cluster_var: str) -> float:
+    """Compute F-statistic for excluded instrument."""
+    result = ols_clustered(df, endog_var, [instrument] + controls, cluster_var)
+
+    # F = (coef / se)^2
+    t_stat = result['coef'][instrument] / result['se'][instrument]
+    return t_stat ** 2
+
+
+def nbreg_glm(df: pd.DataFrame, y_var: str, x_vars: list,
+              cluster_var: str) -> dict:
+    """Negative binomial regression (GLM approximation)."""
+    all_vars = [y_var] + x_vars + [cluster_var]
+    data = df[all_vars].copy()
+
+    # Ensure numeric types
+    for col in [y_var] + x_vars:
+        data[col] = pd.to_numeric(data[col], errors='coerce')
+
+    data = data.dropna()
+
+    y = data[y_var].astype(float)
+    X = sm.add_constant(data[x_vars].astype(float))
+
+    # Negative binomial GLM
+    model = sm.GLM(y, X, family=sm.families.NegativeBinomial()).fit(
+        cov_type='cluster',
+        cov_kwds={'groups': data[cluster_var]}
+    )
+
+    return {
+        'coef': model.params,
+        'se': model.bse,
+        'pval': model.pvalues,
+        'pseudo_r2': 1 - model.deviance / model.null_deviance,
+        'nobs': int(model.nobs),
+        'model': model
+    }
+
+
+# =============================================================================
+# PANEL A: ISRAELI ATTACKS AND PREDICTABLE EVENTS
+# =============================================================================
+
+def make_result(col: int, dep_var: str, model: str, var: str,
+                result: dict, f_stat: float = np.nan) -> dict:
+    """Create standardized result dictionary."""
+    return {
+        'column': col,
+        'dep_var': dep_var,
+        'model': model,
+        'var': var,
+        'coef': result['coef'].get(var, np.nan),
+        'se': result['se'].get(var, np.nan),
+        'pval': result['pval'].get(var, np.nan) if 'pval' in result else np.nan,
+        'r2': result.get('r2', result.get('pseudo_r2', np.nan)),
+        'nobs': result['nobs'],
+        'f_stat': f_stat
+    }
+
+
+def run_panel_a(df: pd.DataFrame) -> pd.DataFrame:
+    """Panel A: Israeli Attacks and Predictable Newsworthy Events."""
+
+    sample = filter_sample(df)
+    sample = create_dummies(sample, Config.FE_FULL)
+    fe_cols = get_fe_columns(sample, Config.FE_FULL)
+    controls = Config.PRIOR_PAL + fe_cols
+
+    results = []
+
+    # -------------------------------------------------------------------------
+    # Column 1: First stage (P_t+1)
+    # -------------------------------------------------------------------------
+    r1 = ols_clustered(sample, 'leaddaily_woi',
+                       ['lead_maj_events'] + controls, 'monthyear')
+    f_stat = first_stage_f(sample, 'leaddaily_woi', 'lead_maj_events',
+                           controls, 'monthyear')
+    results.append(make_result(1, 'P_t+1', '1st stage', 'lead_maj_events', r1, f_stat))
+
+    # -------------------------------------------------------------------------
+    # Column 2: First stage (Uncorrected P_t+1)
+    # -------------------------------------------------------------------------
+    r2 = ols_clustered(sample, 'leaddaily_woi_nc',
+                       ['lead_maj_events'] + controls, 'monthyear')
+    f_stat_nc = first_stage_f(sample, 'leaddaily_woi_nc', 'lead_maj_events',
+                              controls, 'monthyear')
+    results.append(make_result(2, 'Uncorr P_t+1', '1st stage', 'lead_maj_events', r2, f_stat_nc))
+
+    # -------------------------------------------------------------------------
+    # Column 3: 2SLS (Occurrence ~ P_t+1)
+    # -------------------------------------------------------------------------
+    r3 = iv_2sls(sample, 'occurrence', 'leaddaily_woi',
+                 'lead_maj_events', controls, 'monthyear')
+    results.append(make_result(3, 'Occurrence', '2SLS', 'leaddaily_woi', r3, f_stat))
+
+    # -------------------------------------------------------------------------
+    # Column 4: 2SLS (Occurrence ~ Uncorr P_t+1)
+    # -------------------------------------------------------------------------
+    r4 = iv_2sls(sample, 'occurrence', 'leaddaily_woi_nc',
+                 'lead_maj_events', controls, 'monthyear')
+    results.append(make_result(4, 'Occurrence', '2SLS', 'leaddaily_woi_nc', r4, f_stat_nc))
+
+    # -------------------------------------------------------------------------
+    # Column 5: Reduced form (Occurrence ~ Events)
+    # -------------------------------------------------------------------------
+    r5 = ols_clustered(sample, 'occurrence',
+                       ['lead_maj_events'] + controls, 'monthyear')
+    results.append(make_result(5, 'Occurrence', 'Reduced form', 'lead_maj_events', r5))
+
+    # -------------------------------------------------------------------------
+    # Column 6: NB IV (Victims ~ P_t+1)
+    # -------------------------------------------------------------------------
+    r6 = nbreg_glm(sample, 'victims_isr',
+                   ['leaddaily_woi'] + controls, 'monthyear')
+    results.append(make_result(6, 'Num. Victims', 'NB GLM', 'leaddaily_woi', r6, f_stat))
+
+    # -------------------------------------------------------------------------
+    # Column 7: NB IV (Victims ~ Uncorr P_t+1)
+    # -------------------------------------------------------------------------
+    r7 = nbreg_glm(sample, 'victims_isr',
+                   ['leaddaily_woi_nc'] + controls, 'monthyear')
+    results.append(make_result(7, 'Num. Victims', 'NB GLM', 'leaddaily_woi_nc', r7, f_stat_nc))
+
+    # -------------------------------------------------------------------------
+    # Column 8: NB Reduced form (Victims ~ Events)
+    # -------------------------------------------------------------------------
+    r8 = nbreg_glm(sample, 'victims_isr',
+                   ['lead_maj_events'] + controls, 'monthyear')
+    results.append(make_result(8, 'Num. Victims', 'NB Reduced', 'lead_maj_events', r8))
+
+    return pd.DataFrame(results)
+
+
+# =============================================================================
+# PANEL B: PALESTINIAN ATTACKS AND PREDICTABLE EVENTS
+# =============================================================================
+
+def run_panel_b(df: pd.DataFrame) -> pd.DataFrame:
+    """Panel B: Palestinian Attacks and Predictable Newsworthy Events."""
+
+    sample = filter_sample(df)
+    sample = create_dummies(sample, Config.FE_PARTIAL)
+    fe_cols = get_fe_columns(sample, Config.FE_PARTIAL)
+    controls = Config.PRIOR_ISR + fe_cols
+
+    results = []
+
+    # Column 1: First stage (P_t+1)
+    r1 = ols_clustered(sample, 'leaddaily_woi',
+                       ['lead_maj_events'] + controls, 'monthyear')
+    f_stat = first_stage_f(sample, 'leaddaily_woi', 'lead_maj_events',
+                           controls, 'monthyear')
+    results.append(make_result(1, 'P_t+1', '1st stage', 'lead_maj_events', r1, f_stat))
+
+    # Column 2: First stage (Uncorrected P_t+1)
+    r2 = ols_clustered(sample, 'leaddaily_woi_nc',
+                       ['lead_maj_events'] + controls, 'monthyear')
+    f_stat_nc = first_stage_f(sample, 'leaddaily_woi_nc', 'lead_maj_events',
+                              controls, 'monthyear')
+    results.append(make_result(2, 'Uncorr P_t+1', '1st stage', 'lead_maj_events', r2, f_stat_nc))
+
+    # Column 3: 2SLS (Occurrence ~ P_t+1)
+    r3 = iv_2sls(sample, 'occurrence_pal', 'leaddaily_woi',
+                 'lead_maj_events', controls, 'monthyear')
+    results.append(make_result(3, 'Occurrence', '2SLS', 'leaddaily_woi', r3, f_stat))
+
+    # Column 4: 2SLS (Occurrence ~ Uncorr P_t+1)
+    r4 = iv_2sls(sample, 'occurrence_pal', 'leaddaily_woi_nc',
+                 'lead_maj_events', controls, 'monthyear')
+    results.append(make_result(4, 'Occurrence', '2SLS', 'leaddaily_woi_nc', r4, f_stat_nc))
+
     # Column 5: Reduced form
-    print("\n[Col 5] Reduced form: Occurrence ~ events")
-    rf5 = reduced_form_occurrence(df_b, 'occurrence_pal', 'lead_maj_events',
-                                  controls_full, cluster)
-    print(f"  Coef: {rf5.params['lead_maj_events']:.3f}")
-    print(f"  SE:   {rf5.bse['lead_maj_events']:.3f}")
-    
-    # Column 6: 2SLS - victims
-    print("\n[Col 6] NB-IV: Victims ~ P(t+1)")
-    nb6 = negbin_iv(df_b, 'victims_pal', 'leaddaily_woi', 'lead_maj_events',
-                    controls_full, cluster)
-    print(f"  Coef: {nb6.params['leaddaily_woi']:.3f}")
-    print(f"  SE:   {nb6.bse['leaddaily_woi']:.3f}")
-    
-    # Column 7: 2SLS - victims (uncorrected)
-    print("\n[Col 7] NB-IV: Victims ~ Uncorrected P(t+1)")
-    nb7 = negbin_iv(df_b, 'victims_pal', 'leaddaily_woi_nc',
-                    'lead_maj_events', controls_full, cluster)
-    print(f"  Coef: {nb7.params['leaddaily_woi_nc']:.3f}")
-    print(f"  SE:   {nb7.bse['leaddaily_woi_nc']:.3f}")
-    
-    # Column 8: Reduced form - victims
-    print("\n[Col 8] Reduced form: Victims ~ events")
-    rf8 = reduced_form_victims(df_b, 'victims_pal', 'lead_maj_events',
-                               controls_full, cluster)
-    print(f"  Coef: {rf8.params['lead_maj_events']:.3f}")
-    print(f"  SE:   {rf8.bse['lead_maj_events']:.3f}")
+    r5 = ols_clustered(sample, 'occurrence_pal',
+                       ['lead_maj_events'] + controls, 'monthyear')
+    results.append(make_result(5, 'Occurrence', 'Reduced form', 'lead_maj_events', r5))
 
-# ============================================================================
-# PANEL C: PLACEBO - ISRAELI ATTACKS & DISASTERS
-# ============================================================================
+    # Column 6: NB (Victims ~ P_t+1)
+    r6 = nbreg_glm(sample, 'victims_pal',
+                   ['leaddaily_woi'] + controls, 'monthyear')
+    results.append(make_result(6, 'Num. Victims', 'NB GLM', 'leaddaily_woi', r6, f_stat))
 
-def panel_c(df):
-    """
-    Panel C (Placebo): Israeli Attacks and Unpredictable Events
-    """
-    
-    print("\n" + "="*70)
-    print("PANEL C: PLACEBO - ISRAELI ATTACKS & DISASTERS")
-    print("="*70)
-    
-    # Filter: no Gaza war
-    df_c = df[df['gaza_war'] == 0].copy()
-    
-    # Controls (same as Panel A)
-    controls_isr = ['occurrence_pal_1', 'occurrence_pal_2_7',
-                    'occurrence_pal_8_14']
-    
-    month_cols = [c for c in df_c.columns if c.startswith('mon')]
-    year_cols = [c for c in df_c.columns if c.startswith('year')]
-    dow_cols = [c for c in df_c.columns if c.startswith('day')]
-    
-    controls_full = controls_isr + month_cols + year_cols + dow_cols
-    
-    cluster = 'monthyear'
-    
-    # Column 1: First stage - DISASTER instrument
-    print("\n[Col 1] First stage: P(t+1) ~ Disaster onset")
-    fs1, f1 = first_stage(df_c, 'leaddaily_woi', 'lead_disaster',
-                         controls_full, cluster)
-    print(f"  Coef: {fs1.params['lead_disaster']:.3f}")
-    print(f"  SE:   {fs1.bse['lead_disaster']:.3f}")
-    print(f"  F-stat: {f1:.2f}")
-    
-    # Column 2: First stage - uncorrected
-    print("\n[Col 2] First stage: Uncorrected P(t+1) ~ Disaster")
-    fs2, f2 = first_stage(df_c, 'leaddaily_woi_nc', 'lead_disaster',
-                         controls_full, cluster)
-    print(f"  Coef: {fs2.params['lead_disaster']:.3f}")
-    print(f"  SE:   {fs2.bse['lead_disaster']:.3f}")
-    print(f"  F-stat: {f2:.2f}")
-    
-    # Column 3: 2SLS - occurrence
-    print("\n[Col 3] 2SLS: Occurrence ~ P(t+1)")
-    ss3 = second_stage_occurrence(df_c, 'occurrence', 'leaddaily_woi',
-                                  'lead_disaster', controls_full, cluster)
-    print(f"  Coef: {ss3.params['leaddaily_woi']:.3f}")
-    print(f"  SE:   {ss3.bse['leaddaily_woi']:.3f}")
-    
-    # Column 4: 2SLS - occurrence (uncorrected)
-    print("\n[Col 4] 2SLS: Occurrence ~ Uncorrected P(t+1)")
-    ss4 = second_stage_occurrence(df_c, 'occurrence', 'leaddaily_woi_nc',
-                                  'lead_disaster', controls_full, cluster)
-    print(f"  Coef: {ss4.params['leaddaily_woi_nc']:.3f}")
-    print(f"  SE:   {ss4.bse['leaddaily_woi_nc']:.3f}")
-    
+    # Column 7: NB (Victims ~ Uncorr P_t+1)
+    r7 = nbreg_glm(sample, 'victims_pal',
+                   ['leaddaily_woi_nc'] + controls, 'monthyear')
+    results.append(make_result(7, 'Num. Victims', 'NB GLM', 'leaddaily_woi_nc', r7, f_stat_nc))
+
+    # Column 8: NB Reduced form
+    r8 = nbreg_glm(sample, 'victims_pal',
+                   ['lead_maj_events'] + controls, 'monthyear')
+    results.append(make_result(8, 'Num. Victims', 'NB Reduced', 'lead_maj_events', r8))
+
+    return pd.DataFrame(results)
+
+
+# =============================================================================
+# PANEL C: PLACEBO - ISRAELI ATTACKS AND UNPREDICTABLE EVENTS
+# =============================================================================
+
+def run_panel_c(df: pd.DataFrame) -> pd.DataFrame:
+    """Panel C: Placebo - Israeli Attacks and Unpredictable Events."""
+
+    sample = filter_sample(df)
+    sample = create_dummies(sample, Config.FE_FULL)
+    fe_cols = get_fe_columns(sample, Config.FE_FULL)
+    controls = Config.PRIOR_PAL + fe_cols
+
+    results = []
+
+    # Column 1: First stage (P_t+1)
+    r1 = ols_clustered(sample, 'leaddaily_woi',
+                       ['lead_disaster'] + controls, 'monthyear')
+    f_stat = first_stage_f(sample, 'leaddaily_woi', 'lead_disaster',
+                           controls, 'monthyear')
+    results.append(make_result(1, 'P_t+1', '1st stage', 'lead_disaster', r1, f_stat))
+
+    # Column 2: First stage (Uncorrected P_t+1)
+    r2 = ols_clustered(sample, 'leaddaily_woi_nc',
+                       ['lead_disaster'] + controls, 'monthyear')
+    f_stat_nc = first_stage_f(sample, 'leaddaily_woi_nc', 'lead_disaster',
+                              controls, 'monthyear')
+    results.append(make_result(2, 'Uncorr P_t+1', '1st stage', 'lead_disaster', r2, f_stat_nc))
+
+    # Column 3: 2SLS (Occurrence ~ P_t+1)
+    r3 = iv_2sls(sample, 'occurrence', 'leaddaily_woi',
+                 'lead_disaster', controls, 'monthyear')
+    results.append(make_result(3, 'Occurrence', '2SLS', 'leaddaily_woi', r3, f_stat))
+
+    # Column 4: 2SLS (Occurrence ~ Uncorr P_t+1)
+    r4 = iv_2sls(sample, 'occurrence', 'leaddaily_woi_nc',
+                 'lead_disaster', controls, 'monthyear')
+    results.append(make_result(4, 'Occurrence', '2SLS', 'leaddaily_woi_nc', r4, f_stat_nc))
+
     # Column 5: Reduced form
-    print("\n[Col 5] Reduced form: Occurrence ~ Disaster")
-    rf5 = reduced_form_occurrence(df_c, 'occurrence', 'lead_disaster',
-                                  controls_full, cluster)
-    print(f"  Coef: {rf5.params['lead_disaster']:.3f}")
-    print(f"  SE:   {rf5.bse['lead_disaster']:.3f}")
-    
-    # Column 6: 2SLS - victims
-    print("\n[Col 6] NB-IV: Victims ~ P(t+1)")
-    nb6 = negbin_iv(df_c, 'victims_isr', 'leaddaily_woi', 'lead_disaster',
-                    controls_full, cluster)
-    print(f"  Coef: {nb6.params['leaddaily_woi']:.3f}")
-    print(f"  SE:   {nb6.bse['leaddaily_woi']:.3f}")
-    
-    # Column 7: 2SLS - victims (uncorrected)
-    print("\n[Col 7] NB-IV: Victims ~ Uncorrected P(t+1)")
-    nb7 = negbin_iv(df_c, 'victims_isr', 'leaddaily_woi_nc', 'lead_disaster',
-                    controls_full, cluster)
-    print(f"  Coef: {nb7.params['leaddaily_woi_nc']:.3f}")
-    print(f"  SE:   {nb7.bse['leaddaily_woi_nc']:.3f}")
-    
-    # Column 8: Reduced form - victims
-    print("\n[Col 8] Reduced form: Victims ~ Disaster")
-    rf8 = reduced_form_victims(df_c, 'victims_isr', 'lead_disaster',
-                               controls_full, cluster)
-    print(f"  Coef: {rf8.params['lead_disaster']:.3f}")
-    print(f"  SE:   {rf8.bse['lead_disaster']:.3f}")
+    r5 = ols_clustered(sample, 'occurrence',
+                       ['lead_disaster'] + controls, 'monthyear')
+    results.append(make_result(5, 'Occurrence', 'Reduced form', 'lead_disaster', r5))
 
-# ============================================================================
+    # Column 6: NB (Victims ~ P_t+1)
+    r6 = nbreg_glm(sample, 'victims_isr',
+                   ['leaddaily_woi'] + controls, 'monthyear')
+    results.append(make_result(6, 'Num. Victims', 'NB GLM', 'leaddaily_woi', r6, f_stat))
+
+    # Column 7: NB (Victims ~ Uncorr P_t+1)
+    r7 = nbreg_glm(sample, 'victims_isr',
+                   ['leaddaily_woi_nc'] + controls, 'monthyear')
+    results.append(make_result(7, 'Num. Victims', 'NB GLM', 'leaddaily_woi_nc', r7, f_stat_nc))
+
+    # Column 8: NB Reduced form
+    r8 = nbreg_glm(sample, 'victims_isr',
+                   ['lead_disaster'] + controls, 'monthyear')
+    results.append(make_result(8, 'Num. Victims', 'NB Reduced', 'lead_disaster', r8))
+
+    return pd.DataFrame(results)
+
+
+# =============================================================================
+# OUTPUT FORMATTING
+# =============================================================================
+
+def add_stars(coef: float, pval: float) -> str:
+    """Add significance stars to coefficient."""
+    if pd.isna(coef):
+        return "—"
+    if pd.isna(pval):
+        return f"{coef:.3f}"
+    stars = ''
+    if pval < 0.01:
+        stars = '***'
+    elif pval < 0.05:
+        stars = '**'
+    elif pval < 0.10:
+        stars = '*'
+    return f"{coef:.3f}{stars}"
+
+
+def format_se(se: float) -> str:
+    """Format standard error in parentheses."""
+    if pd.isna(se):
+        return ""
+    return f"({se:.3f})"
+
+
+def format_r2(r2: float) -> str:
+    """Format R-squared."""
+    if pd.isna(r2):
+        return "—"
+    return f"{r2:.3f}"
+
+
+def format_f(f: float) -> str:
+    """Format F-statistic."""
+    if pd.isna(f):
+        return "—"
+    return f"{f:.2f}"
+
+
+def print_table_header():
+    """Print table title."""
+    width = 120
+    print("\n" + "═" * width)
+    print("TABLE 5: ATTACKS AND NEXT-DAY NEWS PRESSURE DRIVEN BY")
+    print("PREDICTABLE POLITICAL AND SPORTS EVENTS")
+    print("═" * width)
+
+
+def print_panel_header(panel_name: str, dep_vars: list, models: list):
+    """Print panel header with column labels."""
+    width = 120
+    col_width = 12
+
+    print("\n" + "─" * width)
+    print(f"  {panel_name}")
+    print("─" * width)
+
+    # Column numbers
+    header1 = f"{'':30}"
+    for i in range(1, 9):
+        header1 += f"({i}){'':{col_width-3}}"
+    print(header1)
+
+    # Dependent variables
+    header2 = f"{'Dependent variable:':30}"
+    for dv in dep_vars:
+        header2 += f"{dv:>{col_width}}"
+    print(header2)
+
+    # Models
+    header3 = f"{'Model:':30}"
+    for m in models:
+        header3 += f"{m:>{col_width}}"
+    print(header3)
+
+    print("─" * width)
+
+
+def print_coef_row(label: str, coefs: list, ses: list, pvals: list):
+    """Print coefficient row with standard errors below."""
+    col_width = 12
+
+    # Coefficients with stars
+    row1 = f"{label:30}"
+    for coef, pval in zip(coefs, pvals):
+        row1 += f"{add_stars(coef, pval):>{col_width}}"
+    print(row1)
+
+    # Standard errors
+    row2 = f"{'':30}"
+    for se in ses:
+        row2 += f"{format_se(se):>{col_width}}"
+    print(row2)
+
+
+def print_info_row(label: str, values: list):
+    """Print information row (FE, Obs, R2, F-stat)."""
+    col_width = 12
+    row = f"{label:30}"
+    for v in values:
+        if isinstance(v, bool):
+            row += f"{'Yes' if v else 'No':>{col_width}}"
+        elif isinstance(v, int):
+            row += f"{v:>{col_width},}"
+        elif isinstance(v, float):
+            if pd.isna(v):
+                row += f"{'—':>{col_width}}"
+            else:
+                row += f"{v:>{col_width}.3f}"
+        else:
+            row += f"{str(v):>{col_width}}"
+    print(row)
+
+
+def format_panel_table(results_df: pd.DataFrame, panel_name: str,
+                       main_var: str, fe_label: str, prior_label: str):
+    """Format and print a single panel as publication-style table."""
+
+    # Define column structure
+    dep_vars = ['P t+1', 'Uncorr P t+1', 'Occurrence', 'Occurrence',
+                'Occurrence', 'Num.Victims', 'Num.Victims', 'Num.Victims']
+    models = ['2SLS', '2SLS', '2SLS', '2SLS',
+              'OLS', 'ML NB', 'ML NB', 'ML NB']
+    model_types = ['1st stage', '1st stage', '2nd stage', '2nd stage',
+                   'Red. form', 'IV 2nd', 'IV 2nd', 'Red. form']
+
+    print_panel_header(panel_name, dep_vars, models)
+
+    # Model type row
+    col_width = 12
+    row = f"{'':30}"
+    for mt in model_types:
+        row += f"{mt:>{col_width}}"
+    print(row)
+    print()
+
+    # Extract data by column
+    coefs = []
+    ses = []
+    pvals = []
+    nobs = []
+    r2s = []
+    f_stats = []
+
+    for col in range(1, 9):
+        row_data = results_df[results_df['column'] == col].iloc[0]
+        coefs.append(row_data['coef'])
+        ses.append(row_data['se'])
+        pvals.append(row_data.get('pval', np.nan))
+        nobs.append(row_data['nobs'])
+        r2s.append(row_data['r2'])
+        f_stats.append(row_data['f_stat'])
+
+    # Main variable row (instrument or endogenous)
+    # Columns 1,2,5,8 show instrument; 3,4,6,7 show endogenous
+    instr_coefs = [coefs[0], coefs[1], np.nan, np.nan, coefs[4], np.nan, np.nan, coefs[7]]
+    instr_ses = [ses[0], ses[1], np.nan, np.nan, ses[4], np.nan, np.nan, ses[7]]
+    instr_pvals = [pvals[0], pvals[1], np.nan, np.nan, pvals[4], np.nan, np.nan, pvals[7]]
+
+    endog_coefs = [np.nan, np.nan, coefs[2], coefs[3], np.nan, coefs[5], coefs[6], np.nan]
+    endog_ses = [np.nan, np.nan, ses[2], ses[3], np.nan, ses[5], ses[6], np.nan]
+    endog_pvals = [np.nan, np.nan, pvals[2], pvals[3], np.nan, pvals[5], pvals[6], np.nan]
+
+    # Print instrument row
+    print_coef_row(main_var, instr_coefs, instr_ses, instr_pvals)
+    print()
+
+    # Print news pressure row
+    print_coef_row("News pressure t+1",
+                   [np.nan, np.nan, coefs[2], np.nan, np.nan, coefs[5], np.nan, np.nan],
+                   [np.nan, np.nan, ses[2], np.nan, np.nan, ses[5], np.nan, np.nan],
+                   [np.nan, np.nan, pvals[2], np.nan, np.nan, pvals[5], np.nan, np.nan])
+    print()
+
+    # Print uncorrected news pressure row
+    print_coef_row("Uncorrected NP t+1",
+                   [np.nan, np.nan, np.nan, coefs[3], np.nan, np.nan, coefs[6], np.nan],
+                   [np.nan, np.nan, np.nan, ses[3], np.nan, np.nan, ses[6], np.nan],
+                   [np.nan, np.nan, np.nan, pvals[3], np.nan, np.nan, pvals[6], np.nan])
+
+    print()
+    print_info_row(fe_label, [True] * 8)
+    print_info_row(prior_label, [True] * 8)
+    print()
+    print_info_row("Observations", nobs)
+
+    # R-squared row
+    r2_display = []
+    for i, r in enumerate(r2s):
+        if i in [5, 6]:  # IV NB columns don't have R2
+            r2_display.append("—")
+        elif pd.isna(r):
+            r2_display.append("—")
+        else:
+            r2_display.append(f"{r:.3f}")
+
+    row = f"{'(Pseudo) R-squared':30}"
+    for v in r2_display:
+        row += f"{v:>{12}}"
+    print(row)
+
+    # F-statistic row
+    f_display = []
+    for f in f_stats:
+        if pd.isna(f):
+            f_display.append("—")
+        else:
+            f_display.append(f"{f:.2f}")
+
+    row = f"{'F-stat, excl. instr.':30}"
+    for v in f_display:
+        row += f"{v:>{12}}"
+    print(row)
+
+
+def print_full_table(panel_a: pd.DataFrame, panel_b: pd.DataFrame,
+                     panel_c: pd.DataFrame):
+    """Print complete Table 5 in publication format."""
+
+    print_table_header()
+
+    # Panel A
+    format_panel_table(
+        panel_a,
+        "PANEL A: ISRAELI ATTACKS AND PREDICTABLE NEWSWORTHY EVENTS",
+        "Political/sports events t+1",
+        "FEs (year, month, DOW)",
+        "Prior Palestinian attacks"
+    )
+
+    # Panel B
+    format_panel_table(
+        panel_b,
+        "PANEL B: PALESTINIAN ATTACKS AND PREDICTABLE NEWSWORTHY EVENTS",
+        "Political/sports events t+1",
+        "FEs (year, DOW)",
+        "Prior Israeli attacks"
+    )
+
+    # Panel C
+    format_panel_table(
+        panel_c,
+        "PANEL C: PLACEBO - ISRAELI ATTACKS AND UNPREDICTABLE NEWSWORTHY EVENTS",
+        "Disaster onset t+1",
+        "FEs (year, month, DOW)",
+        "Prior Palestinian attacks"
+    )
+
+    print("\n" + "═" * 120)
+    print("Notes: Robust standard errors clustered by month×year in parentheses.")
+    print("*** p<0.01, ** p<0.05, * p<0.1")
+    print("═" * 120)
+
+
+def format_table_publication(panel_a: pd.DataFrame,
+                             panel_b: pd.DataFrame,
+                             panel_c: pd.DataFrame) -> pd.DataFrame:
+    """Format results in publication-style DataFrame for Excel export."""
+
+    rows = []
+
+    for panel_df, panel_name in [(panel_a, 'A'), (panel_b, 'B'), (panel_c, 'C')]:
+        row = {'Panel': panel_name}
+        for _, r in panel_df.iterrows():
+            col = r['column']
+            row[f'({col}) Coef'] = r['coef']
+            row[f'({col}) SE'] = r['se']
+
+        # Add summary stats from first row (all same within panel)
+        row['Observations'] = panel_df.iloc[0]['nobs']
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
 # MAIN EXECUTION
-# ============================================================================
+# =============================================================================
 
-def main():
-    """Main replication function"""
-    
-    print("\n" + "="*70)
-    print("TABLE 5 REPLICATION")
-    print("Attacks and Next-day News Pressure Driven by")
-    print("Predictable Political and Sports Events")
-    print("="*70)
-    
+def main(data_path: str = None):
+    """Main execution function."""
+
+    path = data_path or Config.DATA_PATH
+
     # Load data
-    # MODIFY PATH AS NEEDED
-    data_path = "/Users/sersajur/Documents/PhD/econometric/replication/dta/replication_file1.dta"
-    
-    try:
-        df = load_data(data_path)
-        print(f"\n✓ Data loaded: {len(df)} observations")
-    except FileNotFoundError:
-        print(f"\n✗ Data file not found: {data_path}")
-        print("Please provide the path to replication_file1.dta")
-        return
-    
-    # Create variables
-    df = create_variables(df)
-    print("✓ Variables created")
-    
+    print(f"\nLoading data from: {path}")
+    df = load_data(path)
+    print(f"Observations: {len(df):,}")
+    print(f"Date range: {df['date'].min()} to {df['date'].max()}")
+    print(f"Sample after gaza_war==0 filter: {len(df[df['gaza_war']==0]):,}")
+
     # Run panels
-    panel_a(df)
-    panel_b(df)
-    panel_c(df)
-    
-    print("\n" + "="*70)
-    print("REPLICATION COMPLETE")
-    print("="*70 + "\n")
+    print("\nRunning regressions...")
+
+    print("  → Panel A: Israeli Attacks...")
+    panel_a = run_panel_a(df)
+
+    print("  → Panel B: Palestinian Attacks...")
+    panel_b = run_panel_b(df)
+
+    print("  → Panel C: Placebo (Disasters)...")
+    panel_c = run_panel_c(df)
+
+    # Print formatted table
+    print_full_table(panel_a, panel_b, panel_c)
+
+    # Export to Excel
+    with pd.ExcelWriter(Config.OUTPUT_PATH, engine='openpyxl') as writer:
+        panel_a.to_excel(writer, sheet_name='Panel_A', index=False)
+        panel_b.to_excel(writer, sheet_name='Panel_B', index=False)
+        panel_c.to_excel(writer, sheet_name='Panel_C', index=False)
+
+        combined = format_table_publication(panel_a, panel_b, panel_c)
+        combined.to_excel(writer, sheet_name='Combined', index=False)
+
+    print(f"\nResults exported to: {Config.OUTPUT_PATH}")
+
+    return panel_a, panel_b, panel_c
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    data_path = "/Users/sersajur/Documents/PhD/econometric/replication/dta/replication_file1.dta"
+    main(data_path)
