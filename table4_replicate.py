@@ -70,16 +70,19 @@ def estimate_newey_west(formula, data, lags=7):
 
 
 def estimate_negbin_ml(formula, data, lags=7):
-    """Negative Binomial ML with HAC standard errors"""
-    # Step 1: Fit without covariance to identify the sample
-    temp_model = smf.negativebinomial(formula, data=data).fit()
+    """Negative Binomial ML with HAC standard errors using GLM"""
+    from statsmodels.genmod.families import NegativeBinomial
+    from statsmodels.formula.api import glm
+
+    # Step 1: Fit GLM with NegativeBinomial family without covariance
+    temp_model = glm(formula, data=data, family=NegativeBinomial()).fit()
 
     # Step 2: Use only the data subset that was actually used
     used_index = temp_model.fittedvalues.index
     data_subset = data.loc[used_index]
 
     # Step 3: Fit with HAC covariance
-    model = smf.negativebinomial(formula, data=data_subset).fit(
+    model = glm(formula, data=data_subset, family=NegativeBinomial()).fit(
         cov_type='HAC',
         cov_kwds={'maxlags': lags}
     )
@@ -175,7 +178,7 @@ class Table4Replication:
     # Column 7: Number of victims ~ Full specification
     # ------------------------------------------------------------------------
     def estimate_col7(self):
-        """Column 7: ML Negative Binomial with HAC"""
+        """Column 7: GLM Negative Binomial with HAC SE (matching Stata glm)"""
         # Lag variables: lagdaily_woi, lagdaily_woi2, ..., lagdaily_woi7
         lag_vars = 'lagdaily_woi + ' + ' + '.join([f'lagdaily_woi{i}' for i in range(2, 8)])
         israel_vars = 'occurrence_1 + occurrence_2_7 + occurrence_8_14'
@@ -203,12 +206,75 @@ class Table4Replication:
         print("Estimation complete.")
         return self.results
 
+    # ------------------------------------------------------------------------
+    # Calculate R-squared separately (as in original Stata code)
+    # ------------------------------------------------------------------------
+    def calculate_r_squared(self):
+        """Calculate R-squared using OLS regressions (for display purposes)"""
+        print("\nCalculating R-squared...")
+
+        r2_values = {}
+
+        # Column 1: OLS R²
+        formula = f'occurrence_pal ~ daily_woi + {self.base_controls}'
+        temp_model = smf.ols(formula, data=self.data).fit()
+        r2_values['col1'] = temp_model.rsquared
+
+        # Column 2: OLS R²
+        formula = f'occurrence_pal ~ daily_woi + leaddaily_woi + {self.base_controls}'
+        temp_model = smf.ols(formula, data=self.data).fit()
+        r2_values['col2'] = temp_model.rsquared
+
+        # Column 3: OLS R²
+        lag_vars = 'lagdaily_woi + ' + ' + '.join([f'lagdaily_woi{i}' for i in range(2, 8)])
+        israel_vars = 'occurrence_1 + occurrence_2_7 + occurrence_8_14'
+        formula = (f'occurrence_pal ~ daily_woi + leaddaily_woi + '
+                   f'{lag_vars} + {israel_vars} + {self.base_controls}')
+        temp_model = smf.ols(formula, data=self.data).fit()
+        r2_values['col3'] = temp_model.rsquared
+
+        # Column 4: OLS R²
+        formula = f'lnvic_pal ~ daily_woi + {self.base_controls}'
+        temp_model = smf.ols(formula, data=self.data).fit()
+        r2_values['col4'] = temp_model.rsquared
+
+        # Column 5: OLS R²
+        formula = f'lnvic_pal ~ daily_woi + leaddaily_woi + {self.base_controls}'
+        temp_model = smf.ols(formula, data=self.data).fit()
+        r2_values['col5'] = temp_model.rsquared
+
+        # Column 6: OLS R²
+        formula = (f'lnvic_pal ~ daily_woi + leaddaily_woi + '
+                   f'{lag_vars} + {israel_vars} + {self.base_controls}')
+        temp_model = smf.ols(formula, data=self.data).fit()
+        r2_values['col6'] = temp_model.rsquared
+
+        # Column 7: Negative Binomial pseudo R² (using nbreg as in Stata line 217)
+        formula = (f'victims_pal ~ daily_woi + leaddaily_woi + '
+                   f'{lag_vars} + {israel_vars} + {self.base_controls}')
+        try:
+            # Use negativebinomial (nbreg equivalent) for R²
+            temp_model = smf.negativebinomial(formula, data=self.data).fit(disp=0)
+            r2_values['col7'] = temp_model.prsquared
+        except:
+            # If NegBin fails, try GLM NegativeBinomial
+            try:
+                from statsmodels.genmod.families import NegativeBinomial
+                from statsmodels.formula.api import glm
+                temp_model = glm(formula, data=self.data, family=NegativeBinomial()).fit()
+                # Calculate pseudo R² for GLM
+                r2_values['col7'] = 1 - (temp_model.deviance / temp_model.null_deviance)
+            except:
+                r2_values['col7'] = np.nan
+
+        return r2_values
+
 
 # ============================================================================
 # OUTPUT FORMATTING
 # ============================================================================
 
-def format_results_table(results):
+def format_results_table(results, r2_values):
     """Format results as publication-ready table"""
 
     # Define coefficient names
@@ -265,13 +331,12 @@ def format_results_table(results):
            for i in range(1, 8)}
     }
 
-    # Add R-squared
+    # Add R-squared (from separately calculated values)
     r2_info = {
         'Variable': '(Pseudo) R-squared',
-        **{f'Col{i}': f"{results[f'col{i}'].rsquared:.3f}"
-           for i in range(1, 7)}
+        **{f'Col{i}': f"{r2_values[f'col{i}']:.3f}"
+           for i in range(1, 8)}
     }
-    r2_info['Col7'] = f"{results['col7'].prsquared:.3f}"
 
     # Combine all
     table_df = pd.concat([
@@ -304,9 +369,12 @@ def main():
     replicator = Table4Replication(data)
     results = replicator.estimate_all()
 
+    # Calculate R-squared separately (as in original)
+    r2_values = replicator.calculate_r_squared()
+
     # Format output
     print("\nFormatting results...")
-    table = format_results_table(results)
+    table = format_results_table(results, r2_values)
 
     # Display
     print("\n" + "=" * 60)
