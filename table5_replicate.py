@@ -1,8 +1,15 @@
 """
-Replication of Table 5: Attacks and Next-Day News Pressure
+Replication of Table 5: Attacks and Next-Day News Pressure 
 Driven by Predictable Political and Sports Events
 
 Source: Durante & Zhuravskaya (JPE)
+
+Key methodological notes:
+- Columns 1-2: OLS first stage
+- Columns 3-4: 2SLS second stage (linear)
+- Column 5: OLS reduced form
+- Columns 6-7: Control Function Approach for NB IV (equivalent to Stata's qvf)
+- Column 8: NB reduced form (GLM)
 """
 
 # =============================================================================
@@ -31,7 +38,7 @@ class Config:
 
     # Fixed effects
     FE_FULL = ['month', 'year', 'dow']      # Panel A, C
-    FE_PARTIAL = ['year', 'dow']            # Panel B
+    FE_PARTIAL = ['year', 'dow']            # Panel B (no month FE)
 
     # Prior attacks (controls)
     PRIOR_PAL = ['occurrence_pal_1', 'occurrence_pal_2_7', 'occurrence_pal_8_14']
@@ -55,12 +62,14 @@ def load_data(path: str) -> pd.DataFrame:
         'occurrence_pal_1', 'occurrence_pal_2_7', 'occurrence_pal_8_14',
         'occurrence_1', 'occurrence_2_7', 'occurrence_8_14',
         'victims_isr', 'victims_pal',
-        'gaza_war', 'month', 'year', 'dow'
+        'gaza_war', 'month', 'year'
     ]
 
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Note: dow can be text ('Monday', etc.) - pd.get_dummies will handle it
 
     # Ensure monthyear is suitable for clustering
     if 'monthyear' in df.columns:
@@ -80,16 +89,14 @@ def filter_sample(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def create_dummies(df: pd.DataFrame, cols: list) -> pd.DataFrame:
-    """Create dummy variables for fixed effects."""
+    """Create dummy variables for fixed effects using pd.get_dummies."""
     result = df.copy()
-    for col in cols:
-        # Convert to numeric codes if categorical
-        if result[col].dtype == 'object' or result[col].dtype.name == 'category':
-            result[col] = pd.Categorical(result[col]).codes
 
-        # Create dummies with numeric dtype
-        dummies = pd.get_dummies(result[col], prefix=col, drop_first=True, dtype=float)
+    for var in cols:
+        dummies = pd.get_dummies(result[var], prefix=var, drop_first=True)
+        dummies = dummies.astype(float)
         result = pd.concat([result, dummies], axis=1)
+
     return result
 
 
@@ -97,17 +104,8 @@ def get_fe_columns(df: pd.DataFrame, fe_vars: list) -> list:
     """Get list of fixed effect dummy column names."""
     fe_cols = []
     for var in fe_vars:
-        fe_cols += [c for c in df.columns if c.startswith(f'{var}_')]
+        fe_cols += sorted([c for c in df.columns if c.startswith(f'{var}_')])
     return fe_cols
-
-
-def ensure_numeric(df: pd.DataFrame, cols: list) -> pd.DataFrame:
-    """Ensure all columns are numeric."""
-    result = df.copy()
-    for col in cols:
-        if col in result.columns:
-            result[col] = pd.to_numeric(result[col], errors='coerce')
-    return result
 
 
 # =============================================================================
@@ -116,7 +114,7 @@ def ensure_numeric(df: pd.DataFrame, cols: list) -> pd.DataFrame:
 
 def ols_clustered(df: pd.DataFrame, y_var: str, x_vars: list,
                   cluster_var: str) -> dict:
-    """OLS with clustered standard errors."""
+    """OLS with clustered standard errors (Stata-style)."""
     all_vars = [y_var] + x_vars + [cluster_var]
     data = df[all_vars].copy()
 
@@ -124,24 +122,32 @@ def ols_clustered(df: pd.DataFrame, y_var: str, x_vars: list,
     for col in [y_var] + x_vars:
         data[col] = pd.to_numeric(data[col], errors='coerce')
 
-    # Drop missing values
     data = data.dropna()
 
     y = data[y_var].astype(float)
     X = sm.add_constant(data[x_vars].astype(float))
 
+    # Fit model with clustered SE
     model = sm.OLS(y, X).fit(
         cov_type='cluster',
         cov_kwds={'groups': data[cluster_var]}
     )
 
+    # Stata-style R² (uses demeaned y for R² calculation)
+    # R² = 1 - RSS/TSS where TSS = sum((y - mean(y))^2)
+    y_mean = y.mean()
+    tss = ((y - y_mean) ** 2).sum()
+    rss = (model.resid ** 2).sum()
+    r2_stata = 1 - rss / tss
+
     return {
         'coef': model.params,
         'se': model.bse,
         'pval': model.pvalues,
-        'r2': model.rsquared,
+        'r2': r2_stata,  # Use Stata-style R²
         'nobs': int(model.nobs),
-        'model': model
+        'model': model,
+        'resid': model.resid
     }
 
 
@@ -181,19 +187,16 @@ def first_stage_f(df: pd.DataFrame, endog_var: str, instrument: str,
                   controls: list, cluster_var: str) -> float:
     """Compute F-statistic for excluded instrument."""
     result = ols_clustered(df, endog_var, [instrument] + controls, cluster_var)
-
-    # F = (coef / se)^2
     t_stat = result['coef'][instrument] / result['se'][instrument]
     return t_stat ** 2
 
 
 def nbreg_glm(df: pd.DataFrame, y_var: str, x_vars: list,
               cluster_var: str) -> dict:
-    """Negative binomial regression (GLM approximation)."""
+    """Negative binomial regression (GLM) - for reduced form."""
     all_vars = [y_var] + x_vars + [cluster_var]
     data = df[all_vars].copy()
 
-    # Ensure numeric types
     for col in [y_var] + x_vars:
         data[col] = pd.to_numeric(data[col], errors='coerce')
 
@@ -202,8 +205,8 @@ def nbreg_glm(df: pd.DataFrame, y_var: str, x_vars: list,
     y = data[y_var].astype(float)
     X = sm.add_constant(data[x_vars].astype(float))
 
-    # Negative binomial GLM
-    model = sm.GLM(y, X, family=sm.families.NegativeBinomial()).fit(
+    # NB2 GLM (Stata's default)
+    model = sm.GLM(y, X, family=sm.families.NegativeBinomial(alpha=1.0)).fit(
         cov_type='cluster',
         cov_kwds={'groups': data[cluster_var]}
     )
@@ -218,26 +221,105 @@ def nbreg_glm(df: pd.DataFrame, y_var: str, x_vars: list,
     }
 
 
+def nbreg_iv_control_function(df: pd.DataFrame, y_var: str, endog_var: str,
+                               instrument: str, controls: list,
+                               cluster_var: str) -> dict:
+    """
+    Control Function Approach for IV with Negative Binomial.
+
+    This is the Python equivalent of Stata's qvf command.
+
+    Steps:
+    1. First stage: OLS of endogenous var on instrument + controls
+    2. Get residuals (v_hat)
+    3. Second stage: NB regression with endogenous var + residuals + controls
+
+    The coefficient on the endogenous variable is the IV estimate.
+    """
+    all_vars = [y_var, endog_var, instrument] + controls + [cluster_var]
+    data = df[all_vars].copy()
+
+    for col in [y_var, endog_var, instrument] + controls:
+        data[col] = pd.to_numeric(data[col], errors='coerce')
+
+    data = data.dropna().reset_index(drop=True)
+
+    # Step 1: First stage OLS
+    first_stage_vars = [instrument] + controls
+    X_first = sm.add_constant(data[first_stage_vars].astype(float))
+    y_first = data[endog_var].astype(float)
+
+    first_stage = sm.OLS(y_first, X_first).fit()
+
+    # Get residuals
+    data['v_hat'] = first_stage.resid
+
+    # Step 2: Second stage NB with control function
+    second_stage_vars = [endog_var, 'v_hat'] + controls
+    X_second = sm.add_constant(data[second_stage_vars].astype(float))
+    y_second = data[y_var].astype(float)
+
+    # Fit NB model
+    try:
+        model = sm.GLM(y_second, X_second,
+                       family=sm.families.NegativeBinomial(alpha=1.0)).fit(
+            cov_type='cluster',
+            cov_kwds={'groups': data[cluster_var]}
+        )
+    except:
+        # Fallback: try with different alpha
+        model = sm.GLM(y_second, X_second,
+                       family=sm.families.NegativeBinomial()).fit(
+            cov_type='cluster',
+            cov_kwds={'groups': data[cluster_var]}
+        )
+
+    return {
+        'coef': model.params,
+        'se': model.bse,
+        'pval': model.pvalues,
+        'nobs': int(model.nobs),
+        'model': model,
+        'v_hat_coef': model.params.get('v_hat', np.nan),
+        'v_hat_pval': model.pvalues.get('v_hat', np.nan)
+    }
+
+
 # =============================================================================
-# PANEL A: ISRAELI ATTACKS AND PREDICTABLE EVENTS
+# HELPER FUNCTION
 # =============================================================================
 
 def make_result(col: int, dep_var: str, model: str, var: str,
                 result: dict, f_stat: float = np.nan) -> dict:
     """Create standardized result dictionary."""
+
+    # Handle different result structures
+    if isinstance(result['coef'], pd.Series):
+        coef = result['coef'].get(var, np.nan)
+        se = result['se'].get(var, np.nan)
+        pval = result['pval'].get(var, np.nan) if 'pval' in result else np.nan
+    else:
+        coef = result['coef']
+        se = result['se']
+        pval = result.get('pval', np.nan)
+
     return {
         'column': col,
         'dep_var': dep_var,
         'model': model,
         'var': var,
-        'coef': result['coef'].get(var, np.nan),
-        'se': result['se'].get(var, np.nan),
-        'pval': result['pval'].get(var, np.nan) if 'pval' in result else np.nan,
+        'coef': coef,
+        'se': se,
+        'pval': pval,
         'r2': result.get('r2', result.get('pseudo_r2', np.nan)),
         'nobs': result['nobs'],
         'f_stat': f_stat
     }
 
+
+# =============================================================================
+# PANEL A: ISRAELI ATTACKS AND PREDICTABLE EVENTS
+# =============================================================================
 
 def run_panel_a(df: pd.DataFrame) -> pd.DataFrame:
     """Panel A: Israeli Attacks and Predictable Newsworthy Events."""
@@ -249,62 +331,46 @@ def run_panel_a(df: pd.DataFrame) -> pd.DataFrame:
 
     results = []
 
-    # -------------------------------------------------------------------------
     # Column 1: First stage (P_t+1)
-    # -------------------------------------------------------------------------
     r1 = ols_clustered(sample, 'leaddaily_woi',
                        ['lead_maj_events'] + controls, 'monthyear')
     f_stat = first_stage_f(sample, 'leaddaily_woi', 'lead_maj_events',
                            controls, 'monthyear')
     results.append(make_result(1, 'P_t+1', '1st stage', 'lead_maj_events', r1, f_stat))
 
-    # -------------------------------------------------------------------------
     # Column 2: First stage (Uncorrected P_t+1)
-    # -------------------------------------------------------------------------
     r2 = ols_clustered(sample, 'leaddaily_woi_nc',
                        ['lead_maj_events'] + controls, 'monthyear')
     f_stat_nc = first_stage_f(sample, 'leaddaily_woi_nc', 'lead_maj_events',
                               controls, 'monthyear')
     results.append(make_result(2, 'Uncorr P_t+1', '1st stage', 'lead_maj_events', r2, f_stat_nc))
 
-    # -------------------------------------------------------------------------
     # Column 3: 2SLS (Occurrence ~ P_t+1)
-    # -------------------------------------------------------------------------
     r3 = iv_2sls(sample, 'occurrence', 'leaddaily_woi',
                  'lead_maj_events', controls, 'monthyear')
     results.append(make_result(3, 'Occurrence', '2SLS', 'leaddaily_woi', r3, f_stat))
 
-    # -------------------------------------------------------------------------
     # Column 4: 2SLS (Occurrence ~ Uncorr P_t+1)
-    # -------------------------------------------------------------------------
     r4 = iv_2sls(sample, 'occurrence', 'leaddaily_woi_nc',
                  'lead_maj_events', controls, 'monthyear')
     results.append(make_result(4, 'Occurrence', '2SLS', 'leaddaily_woi_nc', r4, f_stat_nc))
 
-    # -------------------------------------------------------------------------
     # Column 5: Reduced form (Occurrence ~ Events)
-    # -------------------------------------------------------------------------
     r5 = ols_clustered(sample, 'occurrence',
                        ['lead_maj_events'] + controls, 'monthyear')
     results.append(make_result(5, 'Occurrence', 'Reduced form', 'lead_maj_events', r5))
 
-    # -------------------------------------------------------------------------
-    # Column 6: NB IV (Victims ~ P_t+1)
-    # -------------------------------------------------------------------------
-    r6 = nbreg_glm(sample, 'victims_isr',
-                   ['leaddaily_woi'] + controls, 'monthyear')
-    results.append(make_result(6, 'Num. Victims', 'NB GLM', 'leaddaily_woi', r6, f_stat))
+    # Column 6: NB IV using Control Function (Victims ~ P_t+1)
+    r6 = nbreg_iv_control_function(sample, 'victims_isr', 'leaddaily_woi',
+                                    'lead_maj_events', controls, 'monthyear')
+    results.append(make_result(6, 'Num. Victims', 'NB IV (CF)', 'leaddaily_woi', r6, f_stat))
 
-    # -------------------------------------------------------------------------
-    # Column 7: NB IV (Victims ~ Uncorr P_t+1)
-    # -------------------------------------------------------------------------
-    r7 = nbreg_glm(sample, 'victims_isr',
-                   ['leaddaily_woi_nc'] + controls, 'monthyear')
-    results.append(make_result(7, 'Num. Victims', 'NB GLM', 'leaddaily_woi_nc', r7, f_stat_nc))
+    # Column 7: NB IV using Control Function (Victims ~ Uncorr P_t+1)
+    r7 = nbreg_iv_control_function(sample, 'victims_isr', 'leaddaily_woi_nc',
+                                    'lead_maj_events', controls, 'monthyear')
+    results.append(make_result(7, 'Num. Victims', 'NB IV (CF)', 'leaddaily_woi_nc', r7, f_stat_nc))
 
-    # -------------------------------------------------------------------------
     # Column 8: NB Reduced form (Victims ~ Events)
-    # -------------------------------------------------------------------------
     r8 = nbreg_glm(sample, 'victims_isr',
                    ['lead_maj_events'] + controls, 'monthyear')
     results.append(make_result(8, 'Num. Victims', 'NB Reduced', 'lead_maj_events', r8))
@@ -320,7 +386,7 @@ def run_panel_b(df: pd.DataFrame) -> pd.DataFrame:
     """Panel B: Palestinian Attacks and Predictable Newsworthy Events."""
 
     sample = filter_sample(df)
-    sample = create_dummies(sample, Config.FE_PARTIAL)
+    sample = create_dummies(sample, Config.FE_PARTIAL)  # No month FE!
     fe_cols = get_fe_columns(sample, Config.FE_PARTIAL)
     controls = Config.PRIOR_ISR + fe_cols
 
@@ -355,15 +421,15 @@ def run_panel_b(df: pd.DataFrame) -> pd.DataFrame:
                        ['lead_maj_events'] + controls, 'monthyear')
     results.append(make_result(5, 'Occurrence', 'Reduced form', 'lead_maj_events', r5))
 
-    # Column 6: NB (Victims ~ P_t+1)
-    r6 = nbreg_glm(sample, 'victims_pal',
-                   ['leaddaily_woi'] + controls, 'monthyear')
-    results.append(make_result(6, 'Num. Victims', 'NB GLM', 'leaddaily_woi', r6, f_stat))
+    # Column 6: NB IV (Victims ~ P_t+1)
+    r6 = nbreg_iv_control_function(sample, 'victims_pal', 'leaddaily_woi',
+                                    'lead_maj_events', controls, 'monthyear')
+    results.append(make_result(6, 'Num. Victims', 'NB IV (CF)', 'leaddaily_woi', r6, f_stat))
 
-    # Column 7: NB (Victims ~ Uncorr P_t+1)
-    r7 = nbreg_glm(sample, 'victims_pal',
-                   ['leaddaily_woi_nc'] + controls, 'monthyear')
-    results.append(make_result(7, 'Num. Victims', 'NB GLM', 'leaddaily_woi_nc', r7, f_stat_nc))
+    # Column 7: NB IV (Victims ~ Uncorr P_t+1)
+    r7 = nbreg_iv_control_function(sample, 'victims_pal', 'leaddaily_woi_nc',
+                                    'lead_maj_events', controls, 'monthyear')
+    results.append(make_result(7, 'Num. Victims', 'NB IV (CF)', 'leaddaily_woi_nc', r7, f_stat_nc))
 
     # Column 8: NB Reduced form
     r8 = nbreg_glm(sample, 'victims_pal',
@@ -416,15 +482,15 @@ def run_panel_c(df: pd.DataFrame) -> pd.DataFrame:
                        ['lead_disaster'] + controls, 'monthyear')
     results.append(make_result(5, 'Occurrence', 'Reduced form', 'lead_disaster', r5))
 
-    # Column 6: NB (Victims ~ P_t+1)
-    r6 = nbreg_glm(sample, 'victims_isr',
-                   ['leaddaily_woi'] + controls, 'monthyear')
-    results.append(make_result(6, 'Num. Victims', 'NB GLM', 'leaddaily_woi', r6, f_stat))
+    # Column 6: NB IV (Victims ~ P_t+1)
+    r6 = nbreg_iv_control_function(sample, 'victims_isr', 'leaddaily_woi',
+                                    'lead_disaster', controls, 'monthyear')
+    results.append(make_result(6, 'Num. Victims', 'NB IV (CF)', 'leaddaily_woi', r6, f_stat))
 
-    # Column 7: NB (Victims ~ Uncorr P_t+1)
-    r7 = nbreg_glm(sample, 'victims_isr',
-                   ['leaddaily_woi_nc'] + controls, 'monthyear')
-    results.append(make_result(7, 'Num. Victims', 'NB GLM', 'leaddaily_woi_nc', r7, f_stat_nc))
+    # Column 7: NB IV (Victims ~ Uncorr P_t+1)
+    r7 = nbreg_iv_control_function(sample, 'victims_isr', 'leaddaily_woi_nc',
+                                    'lead_disaster', controls, 'monthyear')
+    results.append(make_result(7, 'Num. Victims', 'NB IV (CF)', 'leaddaily_woi_nc', r7, f_stat_nc))
 
     # Column 8: NB Reduced form
     r8 = nbreg_glm(sample, 'victims_isr',
@@ -461,20 +527,6 @@ def format_se(se: float) -> str:
     return f"({se:.3f})"
 
 
-def format_r2(r2: float) -> str:
-    """Format R-squared."""
-    if pd.isna(r2):
-        return "—"
-    return f"{r2:.3f}"
-
-
-def format_f(f: float) -> str:
-    """Format F-statistic."""
-    if pd.isna(f):
-        return "—"
-    return f"{f:.2f}"
-
-
 def print_table_header():
     """Print table title."""
     width = 120
@@ -484,181 +536,145 @@ def print_table_header():
     print("═" * width)
 
 
-def print_panel_header(panel_name: str, dep_vars: list, models: list):
-    """Print panel header with column labels."""
+def print_panel_results(results_df: pd.DataFrame, panel_name: str,
+                        main_var_label: str, fe_label: str, prior_label: str):
+    """Print panel in publication format."""
+
     width = 120
     col_width = 12
 
+    # Panel header
     print("\n" + "─" * width)
     print(f"  {panel_name}")
     print("─" * width)
 
     # Column numbers
-    header1 = f"{'':30}"
+    row = f"{'':32}"
     for i in range(1, 9):
-        header1 += f"({i}){'':{col_width-3}}"
-    print(header1)
+        row += f"({i}){'':{col_width-3}}"
+    print(row)
 
     # Dependent variables
-    header2 = f"{'Dependent variable:':30}"
+    dep_vars = ['P t+1', 'Uncorr P', 'Occurr.', 'Occurr.',
+                'Occurr.', 'Victims', 'Victims', 'Victims']
+    row = f"{'Dependent variable:':32}"
     for dv in dep_vars:
-        header2 += f"{dv:>{col_width}}"
-    print(header2)
+        row += f"{dv:>{col_width}}"
+    print(row)
 
     # Models
-    header3 = f"{'Model:':30}"
+    models = ['2SLS', '2SLS', '2SLS', '2SLS', 'OLS', 'NB IV', 'NB IV', 'NB']
+    row = f"{'Model:':32}"
     for m in models:
-        header3 += f"{m:>{col_width}}"
-    print(header3)
+        row += f"{m:>{col_width}}"
+    print(row)
+
+    # Model types
+    types = ['1st stg', '1st stg', '2nd stg', '2nd stg', 'Red.form', '2nd stg', '2nd stg', 'Red.form']
+    row = f"{'':32}"
+    for t in types:
+        row += f"{t:>{col_width}}"
+    print(row)
 
     print("─" * width)
 
+    # Extract data
+    data = {}
+    for _, r in results_df.iterrows():
+        data[r['column']] = r
 
-def print_coef_row(label: str, coefs: list, ses: list, pvals: list):
-    """Print coefficient row with standard errors below."""
-    col_width = 12
+    # Main variable (instrument) - columns 1, 2, 5, 8
+    coefs = [data[1]['coef'], data[2]['coef'], np.nan, np.nan,
+             data[5]['coef'], np.nan, np.nan, data[8]['coef']]
+    ses = [data[1]['se'], data[2]['se'], np.nan, np.nan,
+           data[5]['se'], np.nan, np.nan, data[8]['se']]
+    pvals = [data[1]['pval'], data[2]['pval'], np.nan, np.nan,
+             data[5]['pval'], np.nan, np.nan, data[8]['pval']]
 
-    # Coefficients with stars
-    row1 = f"{label:30}"
-    for coef, pval in zip(coefs, pvals):
-        row1 += f"{add_stars(coef, pval):>{col_width}}"
-    print(row1)
-
-    # Standard errors
-    row2 = f"{'':30}"
-    for se in ses:
-        row2 += f"{format_se(se):>{col_width}}"
-    print(row2)
-
-
-def print_info_row(label: str, values: list):
-    """Print information row (FE, Obs, R2, F-stat)."""
-    col_width = 12
-    row = f"{label:30}"
-    for v in values:
-        if isinstance(v, bool):
-            row += f"{'Yes' if v else 'No':>{col_width}}"
-        elif isinstance(v, int):
-            row += f"{v:>{col_width},}"
-        elif isinstance(v, float):
-            if pd.isna(v):
-                row += f"{'—':>{col_width}}"
-            else:
-                row += f"{v:>{col_width}.3f}"
-        else:
-            row += f"{str(v):>{col_width}}"
+    row = f"{main_var_label:32}"
+    for c, p in zip(coefs, pvals):
+        row += f"{add_stars(c, p):>{col_width}}"
     print(row)
 
-
-def format_panel_table(results_df: pd.DataFrame, panel_name: str,
-                       main_var: str, fe_label: str, prior_label: str):
-    """Format and print a single panel as publication-style table."""
-
-    # Define column structure
-    dep_vars = ['P t+1', 'Uncorr P t+1', 'Occurrence', 'Occurrence',
-                'Occurrence', 'Num.Victims', 'Num.Victims', 'Num.Victims']
-    models = ['2SLS', '2SLS', '2SLS', '2SLS',
-              'OLS', 'ML NB', 'ML NB', 'ML NB']
-    model_types = ['1st stage', '1st stage', '2nd stage', '2nd stage',
-                   'Red. form', 'IV 2nd', 'IV 2nd', 'Red. form']
-
-    print_panel_header(panel_name, dep_vars, models)
-
-    # Model type row
-    col_width = 12
-    row = f"{'':30}"
-    for mt in model_types:
-        row += f"{mt:>{col_width}}"
-    print(row)
-    print()
-
-    # Extract data by column
-    coefs = []
-    ses = []
-    pvals = []
-    nobs = []
-    r2s = []
-    f_stats = []
-
-    for col in range(1, 9):
-        row_data = results_df[results_df['column'] == col].iloc[0]
-        coefs.append(row_data['coef'])
-        ses.append(row_data['se'])
-        pvals.append(row_data.get('pval', np.nan))
-        nobs.append(row_data['nobs'])
-        r2s.append(row_data['r2'])
-        f_stats.append(row_data['f_stat'])
-
-    # Main variable row (instrument or endogenous)
-    # Columns 1,2,5,8 show instrument; 3,4,6,7 show endogenous
-    instr_coefs = [coefs[0], coefs[1], np.nan, np.nan, coefs[4], np.nan, np.nan, coefs[7]]
-    instr_ses = [ses[0], ses[1], np.nan, np.nan, ses[4], np.nan, np.nan, ses[7]]
-    instr_pvals = [pvals[0], pvals[1], np.nan, np.nan, pvals[4], np.nan, np.nan, pvals[7]]
-
-    endog_coefs = [np.nan, np.nan, coefs[2], coefs[3], np.nan, coefs[5], coefs[6], np.nan]
-    endog_ses = [np.nan, np.nan, ses[2], ses[3], np.nan, ses[5], ses[6], np.nan]
-    endog_pvals = [np.nan, np.nan, pvals[2], pvals[3], np.nan, pvals[5], pvals[6], np.nan]
-
-    # Print instrument row
-    print_coef_row(main_var, instr_coefs, instr_ses, instr_pvals)
-    print()
-
-    # Print news pressure row
-    print_coef_row("News pressure t+1",
-                   [np.nan, np.nan, coefs[2], np.nan, np.nan, coefs[5], np.nan, np.nan],
-                   [np.nan, np.nan, ses[2], np.nan, np.nan, ses[5], np.nan, np.nan],
-                   [np.nan, np.nan, pvals[2], np.nan, np.nan, pvals[5], np.nan, np.nan])
-    print()
-
-    # Print uncorrected news pressure row
-    print_coef_row("Uncorrected NP t+1",
-                   [np.nan, np.nan, np.nan, coefs[3], np.nan, np.nan, coefs[6], np.nan],
-                   [np.nan, np.nan, np.nan, ses[3], np.nan, np.nan, ses[6], np.nan],
-                   [np.nan, np.nan, np.nan, pvals[3], np.nan, np.nan, pvals[6], np.nan])
-
-    print()
-    print_info_row(fe_label, [True] * 8)
-    print_info_row(prior_label, [True] * 8)
-    print()
-    print_info_row("Observations", nobs)
-
-    # R-squared row
-    r2_display = []
-    for i, r in enumerate(r2s):
-        if i in [5, 6]:  # IV NB columns don't have R2
-            r2_display.append("—")
-        elif pd.isna(r):
-            r2_display.append("—")
-        else:
-            r2_display.append(f"{r:.3f}")
-
-    row = f"{'(Pseudo) R-squared':30}"
-    for v in r2_display:
-        row += f"{v:>{12}}"
+    row = f"{'':32}"
+    for s in ses:
+        row += f"{format_se(s):>{col_width}}"
     print(row)
 
-    # F-statistic row
-    f_display = []
-    for f in f_stats:
-        if pd.isna(f):
-            f_display.append("—")
-        else:
-            f_display.append(f"{f:.2f}")
+    # News pressure - columns 3, 6
+    print()
+    coefs = [np.nan, np.nan, data[3]['coef'], np.nan, np.nan, data[6]['coef'], np.nan, np.nan]
+    ses = [np.nan, np.nan, data[3]['se'], np.nan, np.nan, data[6]['se'], np.nan, np.nan]
+    pvals = [np.nan, np.nan, data[3]['pval'], np.nan, np.nan, data[6]['pval'], np.nan, np.nan]
 
-    row = f"{'F-stat, excl. instr.':30}"
-    for v in f_display:
-        row += f"{v:>{12}}"
+    row = f"{'News pressure t+1':32}"
+    for c, p in zip(coefs, pvals):
+        row += f"{add_stars(c, p):>{col_width}}"
+    print(row)
+
+    row = f"{'':32}"
+    for s in ses:
+        row += f"{format_se(s):>{col_width}}"
+    print(row)
+
+    # Uncorrected news pressure - columns 4, 7
+    print()
+    coefs = [np.nan, np.nan, np.nan, data[4]['coef'], np.nan, np.nan, data[7]['coef'], np.nan]
+    ses = [np.nan, np.nan, np.nan, data[4]['se'], np.nan, np.nan, data[7]['se'], np.nan]
+    pvals = [np.nan, np.nan, np.nan, data[4]['pval'], np.nan, np.nan, data[7]['pval'], np.nan]
+
+    row = f"{'Uncorrected NP t+1':32}"
+    for c, p in zip(coefs, pvals):
+        row += f"{add_stars(c, p):>{col_width}}"
+    print(row)
+
+    row = f"{'':32}"
+    for s in ses:
+        row += f"{format_se(s):>{col_width}}"
+    print(row)
+
+    # Fixed effects and controls
+    print()
+    row = f"{fe_label:32}" + f"{'Yes':>{col_width}}" * 8
+    print(row)
+    row = f"{prior_label:32}" + f"{'Yes':>{col_width}}" * 8
+    print(row)
+
+    # Observations
+    print()
+    row = f"{'Observations':32}"
+    for i in range(1, 9):
+        row += f"{data[i]['nobs']:>{col_width},}"
+    print(row)
+
+    # R-squared
+    row = f"{'R-squared':32}"
+    for i in range(1, 9):
+        r2 = data[i]['r2']
+        if pd.isna(r2) or i in [6, 7]:  # IV NB doesn't have R2
+            row += f"{'—':>{col_width}}"
+        else:
+            row += f"{r2:>{col_width}.3f}"
+    print(row)
+
+    # F-statistic
+    row = f"{'F excl. instr.':32}"
+    for i in range(1, 9):
+        f = data[i]['f_stat']
+        if pd.isna(f) or i == 5 or i == 8:
+            row += f"{'—':>{col_width}}"
+        else:
+            row += f"{f:>{col_width}.2f}"
     print(row)
 
 
 def print_full_table(panel_a: pd.DataFrame, panel_b: pd.DataFrame,
                      panel_c: pd.DataFrame):
-    """Print complete Table 5 in publication format."""
+    """Print complete Table 5."""
 
     print_table_header()
 
-    # Panel A
-    format_panel_table(
+    print_panel_results(
         panel_a,
         "PANEL A: ISRAELI ATTACKS AND PREDICTABLE NEWSWORTHY EVENTS",
         "Political/sports events t+1",
@@ -666,8 +682,7 @@ def print_full_table(panel_a: pd.DataFrame, panel_b: pd.DataFrame,
         "Prior Palestinian attacks"
     )
 
-    # Panel B
-    format_panel_table(
+    print_panel_results(
         panel_b,
         "PANEL B: PALESTINIAN ATTACKS AND PREDICTABLE NEWSWORTHY EVENTS",
         "Political/sports events t+1",
@@ -675,10 +690,9 @@ def print_full_table(panel_a: pd.DataFrame, panel_b: pd.DataFrame,
         "Prior Israeli attacks"
     )
 
-    # Panel C
-    format_panel_table(
+    print_panel_results(
         panel_c,
-        "PANEL C: PLACEBO - ISRAELI ATTACKS AND UNPREDICTABLE NEWSWORTHY EVENTS",
+        "PANEL C: PLACEBO - ISRAELI ATTACKS AND UNPREDICTABLE EVENTS",
         "Disaster onset t+1",
         "FEs (year, month, DOW)",
         "Prior Palestinian attacks"
@@ -686,6 +700,7 @@ def print_full_table(panel_a: pd.DataFrame, panel_b: pd.DataFrame,
 
     print("\n" + "═" * 120)
     print("Notes: Robust standard errors clustered by month×year in parentheses.")
+    print("NB IV estimated using Control Function Approach (equivalent to Stata's qvf).")
     print("*** p<0.01, ** p<0.05, * p<0.1")
     print("═" * 120)
 
@@ -693,18 +708,16 @@ def print_full_table(panel_a: pd.DataFrame, panel_b: pd.DataFrame,
 def format_table_publication(panel_a: pd.DataFrame,
                              panel_b: pd.DataFrame,
                              panel_c: pd.DataFrame) -> pd.DataFrame:
-    """Format results in publication-style DataFrame for Excel export."""
+    """Format results for Excel export."""
 
     rows = []
-
     for panel_df, panel_name in [(panel_a, 'A'), (panel_b, 'B'), (panel_c, 'C')]:
         row = {'Panel': panel_name}
         for _, r in panel_df.iterrows():
             col = r['column']
             row[f'({col}) Coef'] = r['coef']
             row[f'({col}) SE'] = r['se']
-
-        # Add summary stats from first row (all same within panel)
+            row[f'({col}) pval'] = r['pval']
         row['Observations'] = panel_df.iloc[0]['nobs']
         rows.append(row)
 
@@ -723,9 +736,8 @@ def main(data_path: str = None):
     # Load data
     print(f"\nLoading data from: {path}")
     df = load_data(path)
-    print(f"Observations: {len(df):,}")
-    print(f"Date range: {df['date'].min()} to {df['date'].max()}")
-    print(f"Sample after gaza_war==0 filter: {len(df[df['gaza_war']==0]):,}")
+    print(f"Total observations: {len(df):,}")
+    print(f"Sample (gaza_war==0): {len(df[df['gaza_war']==0]):,}")
 
     # Run panels
     print("\nRunning regressions...")
