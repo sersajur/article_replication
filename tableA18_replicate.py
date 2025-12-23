@@ -266,12 +266,12 @@ def print_panel_a_table(results_dict):
 def print_panel_b_table(results_dict):
     """Форматує Panel B"""
 
-    print("\n" + "═" * 120)
+    print("\n" + "═" * 130)
     print("PANEL B: All news stories about the Israeli-Palestinian conflict")
-    print("═" * 120)
-    print(f"{'Content':<28} {'Next-day':<11} {'N×Pal':<11} {'Other days':<11} {'Particular':<11} {'Palestinian':<11}")
-    print(f"{'':28} {'(q8)':<11} {'(q8×q6)':<11} {'(otherdays)':<11} {'attack(q4)':<11} {'attack(q6)':<11}")
-    print("─" * 120)
+    print("═" * 130)
+    print(f"{'Content':<28} {'Next-day':<11} {'N×Pal':<11} {'Other days':<11} {'Particular':<11} {'Palestinian':<11} {'R²':<8}")
+    print(f"{'':28} {'(q8)':<11} {'(q8×q6)':<11} {'(otherdays)':<11} {'attack(q4)':<11} {'attack(q6)':<11} {'':<8}")
+    print("─" * 130)
 
     content_labels = {
         'q12': 'Info on location',
@@ -305,21 +305,21 @@ def print_panel_b_table(results_dict):
                     coeffs.append("     ")
                     ses.append("       ")
 
-            # Print coefficient row
-            print(f"{label:<28} {coeffs[0]:11} {coeffs[1]:11} {coeffs[2]:11} {coeffs[3]:11} {coeffs[4]:11}")
+            # Print coefficient row with R²
+            r2_str = f"{res['r2']:.3f}"
+            print(f"{label:<28} {coeffs[0]:11} {coeffs[1]:11} {coeffs[2]:11} {coeffs[3]:11} {coeffs[4]:11} {r2_str:<8}")
             # Print SE row
             print(f"{'':<28} {ses[0]:11} {ses[1]:11} {ses[2]:11} {ses[3]:11} {ses[4]:11}")
 
-    print("─" * 120)
+    print("─" * 130)
 
     # Show sample statistics from first outcome
     first_outcome = list(content_labels.keys())[0]
     if first_outcome in results_dict:
         res = results_dict[first_outcome]
         print(f"{'Observations':<28} {res['n_obs']:<11,}")
-        print(f"{'Average R²':<28} {np.mean([results_dict[k]['r2'] for k in content_labels if k in results_dict]):<11.3f}")
 
-    print("═" * 120)
+    print("═" * 130)
     print("\nNote: *** p<0.01, ** p<0.05, * p<0.1")
     print("Standard errors in parentheses")
     print("All regressions control for: network FE, analyst FE")
